@@ -112,23 +112,45 @@ def get_indicators(data):
 def create_eval_dataset(data, target_shift=1):
     """
     Train.pyのcreate_datasetをベースに、
-    バックテスト用の価格データ(entry, exit)も返すように拡張
+    バックテスト用の価格データ(OHLC)も返すように拡張
     """
     inds = get_indicators(data)
     close = data['close']
-    X, y, trade_prices = [], [], []
+    open_ = data['open']
+    high = data['high']
+    low = data['low']
+
+    X, y, ohlc_data = [], [], []
     feature_keys = ['sma_7', 'sma_30', 'rsi', 'roc', 'bb_width', 'obv_change', 'macd_hist', 'returns', 'lag1']
 
-    for i in range(50, len(close) - target_shift):
+    # 予測用データは i 時点の指標を使う
+    # OHLCデータは、シミュレーション用に全期間保持する必要があるため、少し扱いを変える
+    # ここでは、X[k] に対応するデータポイントの「次の足」からの値動きを見るために、
+    # インデックスを合わせる。
+
+    # i は予測を行う時点。i+1 以降の価格でトレードを行う。
+    start_idx = 50
+    end_idx = len(close) - target_shift # ML評価用のラベル生成のため
+
+    for i in range(start_idx, end_idx):
         feats = [inds[k][i] for k in feature_keys]
         if np.any(np.isnan(feats)): continue
         X.append(feats)
-        # ラベル: target_shift 後に価格が上がっていれば 1、そうでなければ 0
+        # ML評価用ラベル (直近予測精度確認のため残す)
         y.append(1 if close[i + target_shift] > close[i] else 0)
-        # バックテスト用: (エントリー価格, エグジット価格)
-        trade_prices.append((close[i], close[i + target_shift]))
 
-    return np.array(X), np.array(y), trade_prices
+        # バックテスト用: i時点の価格と、その後の価格データへの参照が必要
+        # ここでは単純にインデックスiを返すか、必要なデータを返す
+        # シミュレーションループで i+1 からのデータを参照する
+        ohlc_data.append({
+            'index': i,
+            'open': open_[i],
+            'high': high[i],
+            'low': low[i],
+            'close': close[i]
+        })
+
+    return np.array(X), np.array(y), ohlc_data, data # data全体も返す
 
 # --- 3. 評価・バックテストロジック ---
 
@@ -137,10 +159,11 @@ def load_config():
         "enable_short": False,
         "threshold_long": 0.5,
         "threshold_short": 0.5,
-        "take_profit": 1.0,
-        "stop_loss": 1.0,
+        "take_profit": 0.02,
+        "stop_loss": 0.01,
         "initial_capital": 10000.0,
-        "trading_fee": 0.0
+        "trading_fee": 0.0,
+        "max_positions": 1
     }
     config_path = 'config.json'
     if os.path.exists(config_path):
@@ -172,7 +195,6 @@ def evaluate_performance(symbol, all_5m_data):
     for key, cfg in periods.items():
         print(f"\n>>> {cfg['name']} モデル評価中...")
 
-        # 1. モデル読み込み
         model_path = f"model/model_{symbol}_{key}.pkl"
         if not os.path.exists(model_path):
             print(f"  [!] モデルファイルが見つかりません: {model_path}")
@@ -181,102 +203,206 @@ def evaluate_performance(symbol, all_5m_data):
         with open(model_path, 'rb') as f:
             model = pickle.load(f)
 
-        # 2. データ準備
         resampled = resample_ohlc(all_5m_data, cfg['factor'])
         if resampled is None:
             print("  [!] データ不足のためリサンプリングできませんでした。")
             continue
 
-        X, y_true, trade_prices = create_eval_dataset(resampled, target_shift=cfg['shift'])
+        X, y_true, eval_ohlc, full_data = create_eval_dataset(resampled, target_shift=cfg['shift'])
         if len(X) == 0:
             print("  [!] テスト可能なデータがありません。")
             continue
 
-        # 3. 予測 (ML指標用)
+        # 予測
         y_pred = model.predict(X)
-
-        # 4. 確率予測 (トレード判断用)
         try:
             y_pred_proba = model.predict_proba(X)
         except AttributeError:
-            # predict_probaがない場合
             y_pred_proba = np.vstack([1-y_pred, y_pred]).T
 
-        # 5. 機械学習指標の計算
+        # ML指標
         acc = accuracy_score(y_true, y_pred)
-        prec = precision_score(y_true, y_pred, zero_division=0)
-        rec = recall_score(y_true, y_pred, zero_division=0)
-        f1 = f1_score(y_true, y_pred, zero_division=0)
         cm = confusion_matrix(y_true, y_pred)
 
-        # 6. バックテスト (柔軟なルール)
-        total_return = 0.0
+        # --- 新バックテストロジック ---
+        # パラメータ取得
+        th_long = config.get('threshold_long', 0.5)
+        th_short = config.get('threshold_short', 0.5)
+        enable_short = config.get('enable_short', False)
+        tp_pct = config.get('take_profit', 0.02)
+        sl_pct = config.get('stop_loss', 0.01)
+        fee = config.get('trading_fee', 0.0)
+        max_pos = config.get('max_positions', 1)
+
+        active_positions = [] # list of dict: {type, entry_price, tp_price, sl_price, entry_step}
+        closed_trades = [] # list of return
+
+        # 全データ配列へのアクセスショートカット
+        high_arr = full_data['high']
+        low_arr = full_data['low']
+        close_arr = full_data['close']
+
+        # eval_ohlc は X (予測時点) に対応している。
+        # X[i] で予測した結果は、次の足 (index+1) のOpenでエントリーすると仮定するのが一般的だが、
+        # 簡易化のため「予測時点のClose」でエントリーし、その後の価格変動を見るとする。
+        # ただし、リアルタイム性を考慮すると「iのCloseで判断 -> i+1のOpenで約定」が正しいが、
+        # ここでは元のロジックに合わせ「iのCloseで約定」とする。(create_eval_datasetのtrade_prices準拠)
+
+        # しかし、保有期間無制限のため、i+1, i+2... とループを進める必要がある。
+        # create_eval_datasetの戻り値は「予測が発生した時点」のリスト。
+        # これは時系列順に並んでいるので、これをメインループとして回す。
+
+        for i in range(len(X)):
+            current_idx = eval_ohlc[i]['index']
+            current_close = close_arr[current_idx]
+
+            # 1. 既存ポジションの決済判定 (現在の足のHigh/Lowで判定)
+            # エントリーした「次の足」からHigh/Lowチェックを行うべきだが、
+            # ループは「予測地点」単位で進んでいる。予測地点が連続しているならこれで良い。
+            # しかし、create_eval_datasetでスキップがある場合（指標計算不可など）、飛ぶ可能性がある。
+            # 正確には full_data を1ステップずつ回すべきだが、今回は X に対応するステップのみで簡易シミュレーションする。
+            # (より厳密にするなら、Xのindex間の隙間も埋めてチェックする必要があるが、一旦簡略化)
+
+            # 注: エントリー直後の同一足での決済は考慮しない（エントリーはCloseと仮定するため、変動は次の足から）
+            # よって、ポジションリストにあるのは「以前にエントリーしたもの」のみとする。
+
+            # しかし、ループが「予測発生時」にしか回らないと、予測が発生しない期間の価格変動で決済できない。
+            # そこで、シミュレーションループは `start_idx` から `end_idx` まで 1ステップずつ回す形に変更する。
+            pass
+
+        # --- 再設計: ステップ実行型シミュレーション ---
+
+        # 範囲: 最初の予測可能地点(50) から データ末尾まで
+        sim_start = 50
+        sim_end = len(close_arr)
+
+        # X, y_pred_proba は圧縮されている（NaN除去等）ため、元の時系列インデックスとのマッピングが必要
+        # map_idx_to_pred: full_data_index -> (prob_up, prob_down) or None
+        map_idx_to_pred = {}
+        for k, item in enumerate(eval_ohlc):
+            idx = item['index']
+            map_idx_to_pred[idx] = y_pred_proba[k]
+
+        active_positions = []
         wins = 0
         losses = 0
+        total_return = 0.0
         trade_count = 0
         long_count = 0
         short_count = 0
 
-        th_long = config.get('threshold_long', 0.5)
-        th_short = config.get('threshold_short', 0.5)
-        enable_short = config.get('enable_short', False)
-        tp = config.get('take_profit', 999.0)
-        sl = config.get('stop_loss', 999.0)
-        fee = config.get('trading_fee', 0.0)
+        for t in range(sim_start, sim_end):
+            # 現在の足の価格
+            o = full_data['open'][t]
+            h = full_data['high'][t]
+            l = full_data['low'][t]
+            c = full_data['close'][t]
 
-        for i, proba in enumerate(y_pred_proba):
-            prob_up = proba[1]
-            entry_price, exit_price = trade_prices[i]
+            # 1. 既存ポジションの決済チェック (High/Low判定)
+            # 優先度: SL > TP (保守的)
 
-            raw_ret = 0.0
-            executed = False
+            remaining_positions = []
+            for pos in active_positions:
+                p_type = pos['type']
+                entry = pos['entry_price']
+                tp = pos['tp_price']
+                sl = pos['sl_price']
 
-            # ロング判定
-            if prob_up >= th_long:
-                executed = True
-                long_count += 1
-                raw_ret = (exit_price - entry_price) / entry_price
+                # エントリーした足(pos['idx'] == t)では決済しないルールにする（Closeエントリーのため）
+                if pos['idx'] == t:
+                    remaining_positions.append(pos)
+                    continue
 
-            # ショート判定
-            elif enable_short and prob_up <= th_short:
-                executed = True
-                short_count += 1
-                raw_ret = (entry_price - exit_price) / entry_price
+                executed = False
+                close_rate = 0.0
 
-            if executed:
-                # SL/TP 適用
-                if raw_ret <= -sl:
-                    final_ret = -sl
-                elif raw_ret >= tp:
-                    final_ret = tp
+                if p_type == 'long':
+                    # Long: Low <= SL ?
+                    if l <= sl:
+                        close_rate = sl
+                        executed = True
+                    # Long: High >= TP ?
+                    elif h >= tp:
+                        close_rate = tp
+                        executed = True
+
+                    if executed:
+                        raw_ret = (close_rate - entry) / entry
+
+                elif p_type == 'short':
+                    # Short: High >= SL ?
+                    if h >= sl:
+                        close_rate = sl
+                        executed = True
+                    # Short: Low <= TP ?
+                    elif l <= tp:
+                        close_rate = tp
+                        executed = True
+
+                    if executed:
+                        raw_ret = (entry - close_rate) / entry
+
+                if executed:
+                    # 手数料
+                    final_ret = raw_ret - fee
+                    total_return += final_ret
+                    trade_count += 1
+                    if final_ret > 0: wins += 1
+                    else: losses += 1
+                    # ポジション削除 (remainingに追加しない)
+                    if p_type == 'long': long_count += 1
+                    else: short_count += 1
                 else:
-                    final_ret = raw_ret
+                    remaining_positions.append(pos)
 
-                # 手数料適用
-                final_ret -= fee
+            active_positions = remaining_positions
 
-                total_return += final_ret
-                trade_count += 1
-                if final_ret > 0:
-                    wins += 1
-                else:
-                    losses += 1
+            # 2. 新規エントリー判定 (Close時点)
+            if len(active_positions) < max_pos:
+                if t in map_idx_to_pred:
+                    prob = map_idx_to_pred[t] # [prob_down, prob_up]
+                    prob_up = prob[1]
+
+                    # エントリー判定
+                    entry_type = None
+                    if prob_up >= th_long:
+                        entry_type = 'long'
+                    elif enable_short and prob_up <= th_short:
+                        entry_type = 'short'
+
+                    if entry_type:
+                        entry_price = c # Closeでエントリー
+
+                        if entry_type == 'long':
+                            tp_price = entry_price * (1 + tp_pct)
+                            sl_price = entry_price * (1 - sl_pct)
+                        else:
+                            tp_price = entry_price * (1 - tp_pct)
+                            sl_price = entry_price * (1 + sl_pct)
+
+                        active_positions.append({
+                            'type': entry_type,
+                            'entry_price': entry_price,
+                            'tp_price': tp_price,
+                            'sl_price': sl_price,
+                            'idx': t
+                        })
+
+        # ループ終了
+        # 残っているポジションは除外 (集計に含まない)
 
         win_rate = (wins / trade_count * 100) if trade_count > 0 else 0.0
 
-        # 7. 結果出力
+        # 結果出力
         print(f"  [ML Metrics (Threshold=0.5)]")
-        print(f"    - Accuracy  (正解率): {acc:.2%}")
-        print(f"    - Precision (適合率): {prec:.2%}")
-        print(f"    - Recall    (再現率): {rec:.2%}")
-        print(f"    - F1 Score  (F値)   : {f1:.2f}")
-        print(f"    - Confusion Matrix:\n{cm}")
+        print(f"    - Accuracy: {acc:.2%}")
 
-        print(f"  [Backtest Simulation (Configured)]")
-        print(f"    - Total Trades (取引回数): {trade_count} (Long: {long_count}, Short: {short_count})")
-        print(f"    - Win Rate     (勝率)    : {win_rate:.2f}%")
-        print(f"    - Total Return (累積損益): {total_return:.2%}")
-        print(f"    - Parameters             : Long>={th_long}, Short<={th_short}, TP={tp}, SL={sl}, Fee={fee}")
+        print(f"  [Backtest Simulation (Flexible Holding)]")
+        print(f"    - Total Closed Trades : {trade_count} (L: {long_count}, S: {short_count})")
+        print(f"    - Win Rate            : {win_rate:.2f}%")
+        print(f"    - Total Return        : {total_return:.2%}")
+        print(f"    - Pending Positions   : {len(active_positions)} (Excluded)")
+        print(f"    - Parameters          : TP={tp_pct}, SL={sl_pct}, MaxPos={max_pos}")
 
 # --- 4. メイン処理 ---
 
