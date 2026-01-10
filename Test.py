@@ -163,7 +163,8 @@ def load_config():
         "stop_loss": 0.01,
         "initial_capital": 10000.0,
         "trading_fee": 0.0,
-        "max_positions": 1
+        "max_positions": 1,
+        "ml_metrics": True
     }
     config_path = 'config.json'
     if os.path.exists(config_path):
@@ -222,6 +223,10 @@ def evaluate_performance(symbol, all_5m_data):
 
         # ML指標
         acc = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+
         cm = confusion_matrix(y_true, y_pred)
 
         # --- 新バックテストロジック ---
@@ -394,10 +399,16 @@ def evaluate_performance(symbol, all_5m_data):
         win_rate = (wins / trade_count * 100) if trade_count > 0 else 0.0
 
         # 結果出力
-        print(f"  [ML Metrics (Threshold=0.5)]")
-        print(f"    - Accuracy: {acc:.2%}")
+        if config.get('ml_metrics', True):
+            print(f"  [ML Metrics]")
+            print(f"    - Accuracy  (正解率): {acc:.2%}")
+            print(f"    - Precision (適合率): {prec:.2%}")
+            print(f"    - Recall    (再現率): {rec:.2%}")
+            print(f"    - F1 Score  (F値)   : {f1:.2f}")
+            print(f"    - Confusion Matrix:")
+            print(f"      TN {cm[0][0]}  FP {cm[0][1]}  FN {cm[1][0]}  TP {cm[1][1]}")
 
-        print(f"  [Backtest Simulation (Flexible Holding)]")
+        print(f"  [Backtest Simulation]")
         print(f"    - Total Closed Trades : {trade_count} (L: {long_count}, S: {short_count})")
         print(f"    - Win Rate            : {win_rate:.2f}%")
         print(f"    - Total Return        : {total_return:.2%}")
