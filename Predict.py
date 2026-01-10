@@ -158,7 +158,34 @@ def run_analysis(symbol):
     print("-" * 50)
     print(f" 総合センチメント指数: {avg_p:.2f} %")
 
+def main():
+    if not os.path.exists('model'):
+        print("モデルディレクトリが見つかりません。")
+        return
+
+    available_symbols = set()
+    for f in os.listdir('model'):
+        if f.startswith('model_') and f.endswith('.pkl'):
+            name_body = f[6:-4]
+            for key in ['short', 'mid', 'long']:
+                if name_body.endswith('_' + key):
+                    symbol = name_body[:-(len(key)+1)]
+                    available_symbols.add(symbol)
+                    break
+
+    sorted_symbols = sorted(list(available_symbols))
+    if not sorted_symbols:
+        print("有効なモデルが見つかりません。")
+        return
+
+    print(f"予測可能なペア: {', '.join(sorted_symbols)}")
+    target_symbol = input("予測するペア名を入力してください: ").strip()
+
+    if target_symbol not in available_symbols:
+        print(f"エラー: ペア '{target_symbol}' は存在しません。")
+        return
+
+    run_analysis(target_symbol)
+
 if __name__ == "__main__":
-    symbols_to_analyze = ["SOL_USDT", "BTC_USDT"] 
-    for s in symbols_to_analyze:
-        run_analysis(s)
+    main()
