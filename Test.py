@@ -2,6 +2,7 @@ import os
 import csv
 import json
 import pickle
+import time
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
@@ -12,13 +13,16 @@ def resample_ohlc(data, factor):
     num_bins = n // factor
     if num_bins == 0: return None
     limit = num_bins * factor
-    return {
+    ret = {
         'open': data['open'][:limit].reshape(-1, factor)[:, 0],
         'high': np.max(data['high'][:limit].reshape(-1, factor), axis=1),
         'low': np.min(data['low'][:limit].reshape(-1, factor), axis=1),
         'close': data['close'][:limit].reshape(-1, factor)[:, -1],
         'volume': np.sum(data['volume'][:limit].reshape(-1, factor), axis=1)
     }
+    if 'open_time' in data:
+        ret['open_time'] = data['open_time'][:limit].reshape(-1, factor)[:, 0]
+    return ret
 
 def calc_sma(data, window):
     ret = np.full_like(data, np.nan)
@@ -132,6 +136,8 @@ def create_eval_dataset(data, target_shift=1):
     start_idx = 50
     end_idx = len(close) - target_shift # ML評価用のラベル生成のため
 
+    open_time = data.get('open_time')
+
     for i in range(start_idx, end_idx):
         feats = [inds[k][i] for k in feature_keys]
         if np.any(np.isnan(feats)): continue
@@ -142,13 +148,16 @@ def create_eval_dataset(data, target_shift=1):
         # バックテスト用: i時点の価格と、その後の価格データへの参照が必要
         # ここでは単純にインデックスiを返すか、必要なデータを返す
         # シミュレーションループで i+1 からのデータを参照する
-        ohlc_data.append({
+        item = {
             'index': i,
             'open': open_[i],
             'high': high[i],
             'low': low[i],
             'close': close[i]
-        })
+        }
+        if open_time is not None:
+            item['open_time'] = open_time[i]
+        ohlc_data.append(item)
 
     return np.array(X), np.array(y), ohlc_data, data # data全体も返す
 
@@ -289,19 +298,16 @@ def evaluate_performance(symbol, all_5m_data):
             map_idx_to_pred[idx] = y_pred_proba[k]
 
         active_positions = []
-        wins = 0
-        losses = 0
-        total_return = 0.0
-        trade_count = 0
-        long_count = 0
-        short_count = 0
+        closed_trades = []
+
+        open_time_arr = full_data.get('open_time')
 
         for t in range(sim_start, sim_end):
             # 現在の足の価格
-            o = full_data['open'][t]
             h = full_data['high'][t]
             l = full_data['low'][t]
             c = full_data['close'][t]
+            curr_time = open_time_arr[t] if open_time_arr is not None else None
 
             # 1. 既存ポジションの決済チェック (High/Low判定)
             # 優先度: SL > TP (保守的)
@@ -320,16 +326,19 @@ def evaluate_performance(symbol, all_5m_data):
 
                 executed = False
                 close_rate = 0.0
+                reason = ''
 
                 if p_type == 'long':
                     # Long: Low <= SL ?
                     if l <= sl:
                         close_rate = sl
                         executed = True
+                        reason = 'sl'
                     # Long: High >= TP ?
                     elif h >= tp:
                         close_rate = tp
                         executed = True
+                        reason = 'tp'
 
                     if executed:
                         raw_ret = (close_rate - entry) / entry
@@ -339,10 +348,12 @@ def evaluate_performance(symbol, all_5m_data):
                     if h >= sl:
                         close_rate = sl
                         executed = True
+                        reason = 'sl'
                     # Short: Low <= TP ?
                     elif l <= tp:
                         close_rate = tp
                         executed = True
+                        reason = 'tp'
 
                     if executed:
                         raw_ret = (entry - close_rate) / entry
@@ -350,13 +361,19 @@ def evaluate_performance(symbol, all_5m_data):
                 if executed:
                     # 手数料
                     final_ret = raw_ret - fee
-                    total_return += final_ret
-                    trade_count += 1
-                    if final_ret > 0: wins += 1
-                    else: losses += 1
-                    # ポジション削除 (remainingに追加しない)
-                    if p_type == 'long': long_count += 1
-                    else: short_count += 1
+
+                    closed_trades.append({
+                        'symbol': symbol,
+                        'entry_index': pos['idx'],
+                        'entry_price': entry,
+                        'entry_time': pos.get('entry_time'),
+                        'exit_index': t,
+                        'exit_price': close_rate,
+                        'exit_time': curr_time,
+                        'type': p_type,
+                        'return': final_ret,
+                        'reason': reason
+                    })
                 else:
                     remaining_positions.append(pos)
 
@@ -388,15 +405,48 @@ def evaluate_performance(symbol, all_5m_data):
                         active_positions.append({
                             'type': entry_type,
                             'entry_price': entry_price,
+                            'entry_time': curr_time,
                             'tp_price': tp_price,
                             'sl_price': sl_price,
                             'idx': t
                         })
 
         # ループ終了
-        # 残っているポジションは除外 (集計に含まない)
 
-        win_rate = (wins / trade_count * 100) if trade_count > 0 else 0.0
+        # 集計
+        total_trades = len(closed_trades)
+        win_trades = [tr for tr in closed_trades if tr['return'] > 0]
+        loss_trades = [tr for tr in closed_trades if tr['return'] <= 0]
+
+        wins = len(win_trades)
+        losses = len(loss_trades)
+        long_count = len([tr for tr in closed_trades if tr['type'] == 'long'])
+        short_count = len([tr for tr in closed_trades if tr['type'] == 'short'])
+
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+        total_return = sum(tr['return'] for tr in closed_trades)
+
+        # 追加指標
+        gross_profit = sum(tr['return'] for tr in win_trades)
+        gross_loss = sum(abs(tr['return']) for tr in loss_trades)
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+        avg_win = np.mean([tr['return'] for tr in win_trades]) if wins > 0 else 0.0
+        avg_loss = np.mean([tr['return'] for tr in loss_trades]) if losses > 0 else 0.0
+        payoff_ratio = avg_win / abs(avg_loss) if avg_loss != 0 else float('inf')
+
+        # Max Drawdown (資産曲線ベース)
+        equity_curve = [config['initial_capital']]
+        for tr in closed_trades:
+            equity_curve.append(equity_curve[-1] * (1 + tr['return']))
+        equity_curve = np.array(equity_curve)
+
+        peak = np.maximum.accumulate(equity_curve)
+        if len(peak) > 0:
+            drawdowns = (peak - equity_curve) / peak
+            max_drawdown = np.max(drawdowns)
+        else:
+            max_drawdown = 0.0
 
         # 結果出力
         if config.get('ml_metrics', True):
@@ -409,11 +459,62 @@ def evaluate_performance(symbol, all_5m_data):
             print(f"      TN {cm[0][0]}  FP {cm[0][1]}  FN {cm[1][0]}  TP {cm[1][1]}")
 
         print(f"  [Backtest Simulation]")
-        print(f"    - Total Closed Trades : {trade_count} (L: {long_count}, S: {short_count})")
+        print(f"    - Total Closed Trades : {total_trades} (L: {long_count}, S: {short_count})")
         print(f"    - Win Rate            : {win_rate:.2f}%")
         print(f"    - Total Return        : {total_return:.2%}")
+        print(f"    - Profit Factor       : {profit_factor:.2f}")
+        print(f"    - Max Drawdown        : {max_drawdown:.2%}")
         print(f"    - Pending Positions   : {len(active_positions)} (Excluded)")
         print(f"    - Parameters          : TP={tp_pct}, SL={sl_pct}, MaxPos={max_pos}")
+
+        # JSON出力
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                if isinstance(obj, np.floating):
+                    return float(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super(NumpyEncoder, self).default(obj)
+
+        results = {
+            'config': config,
+            'period': key,
+            'metrics': {
+                'total_trades': total_trades,
+                'wins': wins,
+                'losses': losses,
+                'win_rate': win_rate,
+                'total_return': total_return,
+                'profit_factor': profit_factor,
+                'max_drawdown': max_drawdown,
+                'average_win': avg_win,
+                'average_loss': avg_loss,
+                'payoff_ratio': payoff_ratio
+            },
+            'ml_metrics': {
+                'accuracy': acc,
+                'precision': prec,
+                'recall': rec,
+                'f1_score': f1
+            },
+            'trades': closed_trades
+        }
+
+        output_dir = 'backtest_results'
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        ts = int(time.time())
+        filename = f"{output_dir}/backtest_{symbol}_{key}_{ts}.json"
+
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            print(f"  [Output] 結果を保存しました: {filename}")
+        except Exception as e:
+            print(f"  [!] 結果の保存に失敗しました: {e}")
 
 # --- 4. メイン処理 ---
 
@@ -462,7 +563,7 @@ def main():
 
     # 時系列ソート
     indices = np.argsort(combined_data['open_time'])
-    data_dict = {k: np.array(combined_data[k])[indices] for k in ['open', 'high', 'low', 'close', 'volume']}
+    data_dict = {k: np.array(combined_data[k])[indices] for k in ['open', 'high', 'low', 'close', 'volume', 'open_time']}
 
     # 評価実行
     evaluate_performance(selected_symbol, data_dict)
