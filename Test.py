@@ -5,111 +5,7 @@ import pickle
 import time
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-
-# --- 1. データ集約・指標計算ロジック (Train.py から複製) ---
-
-def resample_ohlc(data, factor):
-    n = len(data['close'])
-    num_bins = n // factor
-    if num_bins == 0: return None
-    limit = num_bins * factor
-    ret = {
-        'open': data['open'][:limit].reshape(-1, factor)[:, 0],
-        'high': np.max(data['high'][:limit].reshape(-1, factor), axis=1),
-        'low': np.min(data['low'][:limit].reshape(-1, factor), axis=1),
-        'close': data['close'][:limit].reshape(-1, factor)[:, -1],
-        'volume': np.sum(data['volume'][:limit].reshape(-1, factor), axis=1)
-    }
-    if 'open_time' in data:
-        ret['open_time'] = data['open_time'][:limit].reshape(-1, factor)[:, 0]
-    return ret
-
-def calc_sma(data, window):
-    ret = np.full_like(data, np.nan)
-    if len(data) < window: return ret
-    cumsum = np.cumsum(np.insert(data, 0, 0))
-    ret[window-1:] = (cumsum[window:] - cumsum[:-window]) / window
-    return ret
-
-def calc_ema(data, window):
-    ret = np.full_like(data, np.nan)
-    valid_mask = ~np.isnan(data)
-    valid_indices = np.where(valid_mask)[0]
-    if len(valid_indices) < window: return ret
-
-    start_idx = valid_indices[0]
-    alpha = 2 / (window + 1)
-
-    first_window_end = start_idx + window
-    if first_window_end > len(data): return ret
-
-    ret[first_window_end-1] = np.mean(data[start_idx:first_window_end])
-    for i in range(first_window_end, len(data)):
-        if np.isnan(data[i]):
-            ret[i] = ret[i-1]
-        else:
-            ret[i] = (data[i] - ret[i-1]) * alpha + ret[i-1]
-    return ret
-
-def calc_rsi(prices, window=14):
-    deltas = np.insert(np.diff(prices), 0, 0)
-    gains = np.maximum(deltas, 0)
-    losses = -np.minimum(deltas, 0)
-    avg_gain = calc_sma(gains, window)
-    avg_loss = calc_sma(losses, window)
-    rs = np.divide(avg_gain, avg_loss, out=np.zeros_like(avg_gain), where=avg_loss!=0)
-    return 100 - (100 / (1 + rs))
-
-def calc_roc(data, window=12):
-    ret = np.full_like(data, np.nan)
-    if len(data) < window: return ret
-    ret[window:] = ((data[window:] - data[:-window]) / (data[:-window] + 1e-9)) * 100
-    return ret
-
-def calc_bb_width(data, window=20):
-    sma = calc_sma(data, window)
-    std = np.full_like(data, np.nan)
-    for i in range(window - 1, len(data)):
-        std[i] = np.std(data[i - window + 1 : i + 1])
-    return (4 * std) / (sma + 1e-9)
-
-def calc_obv(close, volume):
-    obv = np.zeros_like(close)
-    for i in range(1, len(close)):
-        if close[i] > close[i-1]:
-            obv[i] = obv[i-1] + volume[i]
-        elif close[i] < close[i-1]:
-            obv[i] = obv[i-1] - volume[i]
-        else:
-            obv[i] = obv[i-1]
-    obv_change = np.zeros_like(obv)
-    obv_change[1:] = (obv[1:] - obv[:-1]) / (np.abs(obv[:-1]) + 1e-9)
-    return obv_change
-
-def calc_macd_hist(data):
-    ema12 = calc_ema(data, 12)
-    ema26 = calc_ema(data, 26)
-    macd_line = ema12 - ema26
-    signal_line = calc_ema(macd_line, 9)
-    return macd_line - signal_line
-
-def get_indicators(data):
-    close = data['close']
-    vol = data['volume']
-    returns = np.zeros_like(close)
-    returns[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-9)
-
-    return {
-        'sma_7': calc_sma(close, 7),
-        'sma_30': calc_sma(close, 30),
-        'rsi': calc_rsi(close, 14),
-        'roc': calc_roc(close, 12),
-        'bb_width': calc_bb_width(close, 20),
-        'obv_change': calc_obv(close, vol),
-        'macd_hist': calc_macd_hist(close),
-        'returns': returns,
-        'lag1': np.roll(returns, 1)
-    }
+import indicators as ind
 
 # --- 2. 評価用データセット作成 ---
 
@@ -118,14 +14,19 @@ def create_eval_dataset(data, target_shift=1):
     Train.pyのcreate_datasetをベースに、
     バックテスト用の価格データ(OHLC)も返すように拡張
     """
-    inds = get_indicators(data)
+    inds = ind.get_indicators(data)
     close = data['close']
     open_ = data['open']
     high = data['high']
     low = data['low']
 
     X, y, ohlc_data = [], [], []
-    feature_keys = ['sma_7', 'sma_30', 'rsi', 'roc', 'bb_width', 'obv_change', 'macd_hist', 'returns', 'lag1']
+    feature_keys = [
+        'sma_7', 'sma_30', 'rsi', 'roc', 'bb_width', 'obv_change', 'macd_hist',
+        'returns', 'lag1', 'lag2', 'lag3',
+        'atr', 'stoch_k', 'stoch_d', 'cci', 'adx', 'bb_pct_b', 'sma_dev_7',
+        'hour_sin', 'hour_cos'
+    ]
 
     # 予測用データは i 時点の指標を使う
     # OHLCデータは、シミュレーション用に全期間保持する必要があるため、少し扱いを変える
@@ -213,7 +114,7 @@ def evaluate_performance(symbol, all_5m_data):
         with open(model_path, 'rb') as f:
             model = pickle.load(f)
 
-        resampled = resample_ohlc(all_5m_data, cfg['factor'])
+        resampled = ind.resample_ohlc(all_5m_data, cfg['factor'])
         if resampled is None:
             print("  [!] データ不足のためリサンプリングできませんでした。")
             continue

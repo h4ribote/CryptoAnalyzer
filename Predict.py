@@ -4,94 +4,38 @@ import urllib.error
 import pickle
 import numpy as np
 import os
+import indicators as ind
 
 # --- 指標計算ロジック (Train.pyと共通) ---
 
-def calc_sma(data, window):
-    ret = np.full_like(data, np.nan)
-    if len(data) < window: return ret
-    cumsum = np.cumsum(np.insert(data, 0, 0))
-    ret[window-1:] = (cumsum[window:] - cumsum[:-window]) / window
-    return ret
-
-def calc_ema(data, window):
-    ret = np.full_like(data, np.nan)
-    valid_mask = ~np.isnan(data)
-    valid_indices = np.where(valid_mask)[0]
-    if len(valid_indices) < window: return ret
-    start_idx = valid_indices[0]
-    alpha = 2 / (window + 1)
-    first_window_end = start_idx + window
-    if first_window_end > len(data): return ret
-    ret[first_window_end-1] = np.mean(data[start_idx:first_window_end])
-    for i in range(first_window_end, len(data)):
-        if np.isnan(data[i]):
-            ret[i] = ret[i-1]
-        else:
-            ret[i] = (data[i] - ret[i-1]) * alpha + ret[i-1]
-    return ret
-
-def calc_rsi(prices, window=14):
-    deltas = np.insert(np.diff(prices), 0, 0)
-    gains = np.maximum(deltas, 0)
-    losses = -np.minimum(deltas, 0)
-    avg_gain = calc_sma(gains, window)
-    avg_loss = calc_sma(losses, window)
-    rs = np.divide(avg_gain, avg_loss, out=np.zeros_like(avg_gain), where=avg_loss!=0)
-    return 100 - (100 / (1 + rs))
-
-def calc_roc(data, window=12):
-    ret = np.full_like(data, np.nan)
-    if len(data) < window: return ret
-    ret[window:] = ((data[window:] - data[:-window]) / (data[:-window] + 1e-9)) * 100
-    return ret
-
-def calc_bb_width(data, window=20):
-    sma = calc_sma(data, window)
-    std = np.full_like(data, np.nan)
-    for i in range(window - 1, len(data)):
-        std[i] = np.std(data[i - window + 1 : i + 1])
-    return (4 * std) / (sma + 1e-9)
-
-def calc_obv(close, volume):
-    obv = np.zeros_like(close)
-    for i in range(1, len(close)):
-        if close[i] > close[i-1]: obv[i] = obv[i-1] + volume[i]
-        elif close[i] < close[i-1]: obv[i] = obv[i-1] - volume[i]
-        else: obv[i] = obv[i-1]
-    obv_change = np.zeros_like(obv)
-    obv_change[1:] = (obv[1:] - obv[:-1]) / (np.abs(obv[:-1]) + 1e-9)
-    return obv_change
-
-def calc_macd_hist(data):
-    ema12 = calc_ema(data, 12)
-    ema26 = calc_ema(data, 26)
-    macd_line = ema12 - ema26
-    signal_line = calc_ema(macd_line, 9)
-    return macd_line - signal_line
-
 def get_latest_feature(data):
-    close = data['close']
-    vol = data['volume']
-    
-    inds = {
-        'sma_7': calc_sma(close, 7),
-        'sma_30': calc_sma(close, 30),
-        'rsi': calc_rsi(close, 14),
-        'roc': calc_roc(close, 12),
-        'bb_width': calc_bb_width(close, 20),
-        'obv_change': calc_obv(close, vol),
-        'macd_hist': calc_macd_hist(close)
-    }
-    
-    returns = np.zeros_like(close)
-    returns[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-9)
-    
+    # 指標を一括計算
+    inds = ind.get_indicators(data)
+
     # Train.pyのfeature_keysと同じ順序
+    # ['sma_7', 'sma_30', 'rsi', 'roc', 'bb_width', 'obv_change', 'macd_hist', 'returns', 'lag1', 'lag2', 'lag3', 'atr', 'stoch_k', 'stoch_d', 'cci', 'adx', 'bb_pct_b', 'sma_dev_7', 'hour_sin', 'hour_cos']
+
     feats = [
-        inds['sma_7'][-1], inds['sma_30'][-1], inds['rsi'][-1], 
-        inds['roc'][-1], inds['bb_width'][-1], inds['obv_change'][-1], 
-        inds['macd_hist'][-1], returns[-1], returns[-2]
+        inds['sma_7'][-1],
+        inds['sma_30'][-1],
+        inds['rsi'][-1],
+        inds['roc'][-1],
+        inds['bb_width'][-1],
+        inds['obv_change'][-1],
+        inds['macd_hist'][-1],
+        inds['returns'][-1],
+        inds['lag1'][-1],
+        inds['lag2'][-1],
+        inds['lag3'][-1],
+        inds['atr'][-1],
+        inds['stoch_k'][-1],
+        inds['stoch_d'][-1],
+        inds['cci'][-1],
+        inds['adx'][-1],
+        inds['bb_pct_b'][-1],
+        inds['sma_dev_7'][-1],
+        inds['hour_sin'][-1],
+        inds['hour_cos'][-1]
     ]
     return np.array([feats]), inds['rsi'][-1]
 
@@ -100,11 +44,17 @@ def get_latest_feature(data):
 def fetch_mexc_klines(symbol, interval):
     mexc_symbol = symbol.replace("_", "")
     url = f"https://api.mexc.com/api/v3/klines?symbol={mexc_symbol}&interval={interval}&limit=100"
-    
+
     try:
         with urllib.request.urlopen(url) as response:
             klines = json.loads(response.read().decode())
+            # API returns: [Open time, Open, High, Low, Close, Volume, Close time, ...]
+            # Using indices: 0: Time, 1: Open, 2: High, 3: Low, 4: Close, 5: Volume
             return {
+                'open_time': np.array([float(k[0]) for k in klines]),
+                'open': np.array([float(k[1]) for k in klines]),
+                'high': np.array([float(k[2]) for k in klines]),
+                'low': np.array([float(k[3]) for k in klines]),
                 'close': np.array([float(k[4]) for k in klines]),
                 'volume': np.array([float(k[5]) for k in klines])
             }
@@ -118,31 +68,31 @@ def run_analysis(symbol):
     print(f"\n" + "="*50)
     print(f" 市場分析レポート: {symbol} (拡張版)")
     print("="*50)
-    
+
     periods = [
-        ('short', '5m', '短期'), 
-        ('mid', '60m', '中期'), 
+        ('short', '5m', '短期'),
+        ('mid', '60m', '中期'),
         ('long', '1d', '長期')
     ]
-    
+
     results = []
     for key, interval, label in periods:
         model_file = f'model/model_{symbol}_{key}.pkl'
         if not os.path.exists(model_file):
             print(f" [!] {label}モデルが見つかりません: {model_file}")
             continue
-            
+
         with open(model_file, 'rb') as f:
             model = pickle.load(f)
-            
+
         data = fetch_mexc_klines(symbol, interval)
         if data is None: continue
-            
+
         X, rsi = get_latest_feature(data)
         if np.any(np.isnan(X)):
             print(f" [!] {label}計算エラー: 指標に欠損値が含まれています。")
             continue
-            
+
         prob = model.predict_proba(X)[0][1] * 100
         results.append((label, prob, rsi))
 
@@ -153,7 +103,7 @@ def run_analysis(symbol):
     for label, prob, rsi in results:
         status = "強気" if prob > 60 else "弱気" if prob < 40 else "中立"
         print(f"{label:<10} | {prob:>7.2f} % | {rsi:>6.1f} | {status}")
-    
+
     avg_p = sum(r[1] for r in results) / len(results)
     print("-" * 50)
     print(f" 総合センチメント指数: {avg_p:.2f} %")
