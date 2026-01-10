@@ -212,7 +212,7 @@ def evaluate_performance(symbol, all_5m_data):
 # --- 4. メイン処理 ---
 
 def main():
-    history_dir = 'history'
+    history_dir = 'history_for_test'
     if not os.path.exists(history_dir):
         print(f"エラー: '{history_dir}' ディレクトリが見つかりません。")
         return
