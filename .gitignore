@@ -14,3 +14,4 @@ venv/
 .vscode/
 
 model/
+backtest_results/
