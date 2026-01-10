@@ -35,14 +35,14 @@ def calc_ema(data, window):
     valid_mask = ~np.isnan(data)
     valid_indices = np.where(valid_mask)[0]
     if len(valid_indices) < window: return ret
-    
+
     start_idx = valid_indices[0]
     alpha = 2 / (window + 1)
-    
+
     # 最初の有効なウィンドウの平均で初期化
     first_window_end = start_idx + window
     if first_window_end > len(data): return ret
-    
+
     ret[first_window_end-1] = np.mean(data[start_idx:first_window_end])
     for i in range(first_window_end, len(data)):
         if np.isnan(data[i]):
@@ -98,7 +98,7 @@ def get_indicators(data):
     vol = data['volume']
     returns = np.zeros_like(close)
     returns[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-9)
-    
+
     return {
         'sma_7': calc_sma(close, 7),
         'sma_30': calc_sma(close, 30),
@@ -117,7 +117,7 @@ def create_dataset(data, target_shift=1):
     X, y = [], []
     # 指標が安定するまで少し長めに飛ばす (MACD 26+9=35 なので 50あれば安全)
     feature_keys = ['sma_7', 'sma_30', 'rsi', 'roc', 'bb_width', 'obv_change', 'macd_hist', 'returns', 'lag1']
-    
+
     for i in range(50, len(close) - target_shift):
         feats = [inds[k][i] for k in feature_keys]
         if np.any(np.isnan(feats)): continue
@@ -133,21 +133,21 @@ def train_for_symbol(symbol, all_5m_data):
         'mid':   {'factor': 12, 'shift': 4, 'name': '中期'},
         'long':  {'factor': 288, 'shift': 1, 'name': '長期'}
     }
-    
+
     if not os.path.exists('model'): os.makedirs('model')
-    
+
     for key, cfg in periods.items():
         resampled = resample_ohlc(all_5m_data, cfg['factor'])
         if resampled is None: continue
         X, y = create_dataset(resampled, target_shift=cfg['shift'])
-        
+
         if len(X) < 30: # データの閾値を少し緩和
             print(f"  [!] {symbol} {cfg['name']}: 有効な学習データが不足しています (サンプル数: {len(X)})")
             continue
-            
+
         model = GradientBoostingClassifier(n_estimators=100, random_state=42)
         model.fit(X, y)
-        
+
         model_filename = f'model/model_{symbol}_{key}.pkl'
         with open(model_filename, 'wb') as f:
             pickle.dump(model, f)
@@ -166,23 +166,39 @@ def main():
             if symbol not in symbol_files: symbol_files[symbol] = []
             symbol_files[symbol].append(os.path.join(history_dir, filename))
 
-    for symbol, files in symbol_files.items():
-        print(f"\n>>> シンボル: {symbol} の学習を開始します ({len(files)} ファイル)")
-        
-        combined_data = {'open': [], 'high': [], 'low': [], 'close': [], 'volume': [], 'open_time': []}
-        for f_path in files:
-            with open(f_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    try:
-                        for k in combined_data.keys(): combined_data[k].append(float(row[k]))
-                    except: continue
-        
-        if not combined_data['close']: continue
-        indices = np.argsort(combined_data['open_time'])
-        data_dict = {k: np.array(combined_data[k])[indices] for k in ['open', 'high', 'low', 'close', 'volume']}
-        
-        train_for_symbol(symbol, data_dict)
+    available_symbols = sorted(list(symbol_files.keys()))
+    if not available_symbols:
+        print("学習可能なデータが見つかりません。")
+        return
+
+    print(f"学習可能なペア: {', '.join(available_symbols)}")
+
+    selected_symbol = input("学習するペア名を入力してください: ").strip()
+
+    if selected_symbol not in symbol_files:
+        print(f"エラー: ペア '{selected_symbol}' は存在しません。")
+        return
+
+    files = symbol_files[selected_symbol]
+    print(f"\n>>> シンボル: {selected_symbol} の学習を開始します ({len(files)} ファイル)")
+
+    combined_data = {'open': [], 'high': [], 'low': [], 'close': [], 'volume': [], 'open_time': []}
+    for f_path in files:
+        with open(f_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    for k in combined_data.keys(): combined_data[k].append(float(row[k]))
+                except: continue
+
+    if not combined_data['close']:
+        print("有効なデータがありません。")
+        return
+
+    indices = np.argsort(combined_data['open_time'])
+    data_dict = {k: np.array(combined_data[k])[indices] for k in ['open', 'high', 'low', 'close', 'volume']}
+
+    train_for_symbol(selected_symbol, data_dict)
 
 if __name__ == "__main__":
     main()
