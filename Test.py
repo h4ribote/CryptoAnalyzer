@@ -1,5 +1,6 @@
 import os
 import csv
+import json
 import pickle
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
@@ -131,12 +132,38 @@ def create_eval_dataset(data, target_shift=1):
 
 # --- 3. 評価・バックテストロジック ---
 
+def load_config():
+    default_config = {
+        "enable_short": False,
+        "threshold_long": 0.5,
+        "threshold_short": 0.5,
+        "take_profit": 1.0,
+        "stop_loss": 1.0,
+        "initial_capital": 10000.0,
+        "trading_fee": 0.0
+    }
+    config_path = 'config.json'
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                user_config = json.load(f)
+                return {**default_config, **user_config}
+        except Exception as e:
+            print(f"設定ファイルの読み込みに失敗しました: {e}")
+            return default_config
+    else:
+        print("設定ファイル(config.json)が見つかりません。デフォルト値を使用します。")
+        return default_config
+
 def evaluate_performance(symbol, all_5m_data):
     periods = {
         'short': {'factor': 1, 'shift': 3, 'name': '短期 (15分後予測)'},
         'mid':   {'factor': 12, 'shift': 4, 'name': '中期 (4時間後予測)'},
         'long':  {'factor': 288, 'shift': 1, 'name': '長期 (1日後予測)'}
     }
+
+    config = load_config()
+    print(f"現在の設定: {json.dumps(config, indent=2, ensure_ascii=False)}")
 
     print(f"\n{'='*60}")
     print(f" モデル性能評価レポート: {symbol}")
@@ -165,49 +192,91 @@ def evaluate_performance(symbol, all_5m_data):
             print("  [!] テスト可能なデータがありません。")
             continue
 
-        # 3. 予測
+        # 3. 予測 (ML指標用)
         y_pred = model.predict(X)
 
-        # 4. 機械学習指標の計算
+        # 4. 確率予測 (トレード判断用)
+        try:
+            y_pred_proba = model.predict_proba(X)
+        except AttributeError:
+            # predict_probaがない場合
+            y_pred_proba = np.vstack([1-y_pred, y_pred]).T
+
+        # 5. 機械学習指標の計算
         acc = accuracy_score(y_true, y_pred)
         prec = precision_score(y_true, y_pred, zero_division=0)
         rec = recall_score(y_true, y_pred, zero_division=0)
         f1 = f1_score(y_true, y_pred, zero_division=0)
         cm = confusion_matrix(y_true, y_pred)
 
-        # 5. バックテスト (簡易シミュレーション)
-        # ルール: 予測が1なら買い、target_shift後に売り。予測が0なら何もしない。
-        # トランザクションコストは考慮しない。
+        # 6. バックテスト (柔軟なルール)
         total_return = 0.0
         wins = 0
         losses = 0
         trade_count = 0
+        long_count = 0
+        short_count = 0
 
-        for i, prediction in enumerate(y_pred):
-            if prediction == 1:
-                entry_price, exit_price = trade_prices[i]
-                trade_ret = (exit_price - entry_price) / entry_price
-                total_return += trade_ret
+        th_long = config.get('threshold_long', 0.5)
+        th_short = config.get('threshold_short', 0.5)
+        enable_short = config.get('enable_short', False)
+        tp = config.get('take_profit', 999.0)
+        sl = config.get('stop_loss', 999.0)
+        fee = config.get('trading_fee', 0.0)
+
+        for i, proba in enumerate(y_pred_proba):
+            prob_up = proba[1]
+            entry_price, exit_price = trade_prices[i]
+
+            raw_ret = 0.0
+            executed = False
+
+            # ロング判定
+            if prob_up >= th_long:
+                executed = True
+                long_count += 1
+                raw_ret = (exit_price - entry_price) / entry_price
+
+            # ショート判定
+            elif enable_short and prob_up <= th_short:
+                executed = True
+                short_count += 1
+                raw_ret = (entry_price - exit_price) / entry_price
+
+            if executed:
+                # SL/TP 適用
+                if raw_ret <= -sl:
+                    final_ret = -sl
+                elif raw_ret >= tp:
+                    final_ret = tp
+                else:
+                    final_ret = raw_ret
+
+                # 手数料適用
+                final_ret -= fee
+
+                total_return += final_ret
                 trade_count += 1
-                if trade_ret > 0:
+                if final_ret > 0:
                     wins += 1
                 else:
                     losses += 1
 
         win_rate = (wins / trade_count * 100) if trade_count > 0 else 0.0
 
-        # 6. 結果出力
-        print(f"  [ML Metrics]")
+        # 7. 結果出力
+        print(f"  [ML Metrics (Threshold=0.5)]")
         print(f"    - Accuracy  (正解率): {acc:.2%}")
         print(f"    - Precision (適合率): {prec:.2%}")
         print(f"    - Recall    (再現率): {rec:.2%}")
         print(f"    - F1 Score  (F値)   : {f1:.2f}")
         print(f"    - Confusion Matrix:\n{cm}")
 
-        print(f"  [Backtest Simulation]")
-        print(f"    - Total Trades (取引回数): {trade_count}")
+        print(f"  [Backtest Simulation (Configured)]")
+        print(f"    - Total Trades (取引回数): {trade_count} (Long: {long_count}, Short: {short_count})")
         print(f"    - Win Rate     (勝率)    : {win_rate:.2f}%")
         print(f"    - Total Return (累積損益): {total_return:.2%}")
+        print(f"    - Parameters             : Long>={th_long}, Short<={th_short}, TP={tp}, SL={sl}, Fee={fee}")
 
 # --- 4. メイン処理 ---
 

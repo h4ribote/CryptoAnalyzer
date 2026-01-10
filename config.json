@@ -1,0 +1,9 @@
+{
+    "enable_short": true,
+    "threshold_long": 0.55,
+    "threshold_short": 0.45,
+    "take_profit": 0.02,
+    "stop_loss": 0.01,
+    "initial_capital": 10000.0,
+    "trading_fee": 0.001
+}
