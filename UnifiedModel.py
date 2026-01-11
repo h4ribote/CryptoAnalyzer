@@ -309,7 +309,10 @@ def load_config():
         "initial_capital": 10000.0,
         "trading_fee": 0.0,
         "max_positions": 1,
-        "ml_metrics": True
+        "ml_metrics": True,
+        "time_limit_short": 15,
+        "time_limit_mid": 240,
+        "time_limit_long": 1440
     }
     config_path = 'config.json'
     if os.path.exists(config_path):
@@ -535,6 +538,7 @@ class BacktestSimulator:
         self.initial_capital = config.get('initial_capital', 10000.0)
         self.fee = config.get('trading_fee', 0.0)
         self.max_pos = config.get('max_positions', 1)
+        self.time_limit = config.get('time_limit', 0)
 
         self.active_positions = []
         self.closed_trades = []
@@ -569,37 +573,55 @@ class BacktestSimulator:
                 close_price = 0.0
                 reason = ""
 
-                if p_type == 'long':
-                    if lo <= sl_price:
+                # --- 0. 時間切れ判定 (優先) ---
+                if self.time_limit and self.time_limit > 0:
+                    # open_time is in ms, time_limit in minutes
+                    elapsed_ms = t_curr - pos['entry_time']
+                    if elapsed_ms >= self.time_limit * 60 * 1000:
                         is_closed = True
-                        close_price = sl_price
-                        reason = 'sl'
-                    elif hi >= tp_price:
-                        is_closed = True
-                        close_price = tp_price
-                        reason = 'tp'
+                        close_price = op
+                        reason = 'time_limit'
+                        # 時間切れの場合はOpenで決済し、リターン計算へ
 
-                    if is_closed:
-                        if (lo <= sl_price) and (hi >= tp_price):
-                            close_price = sl_price
-                            reason = 'sl'
+                if is_closed:
+                    if p_type == 'long':
                         raw_ret = (close_price - entry_price) / entry_price
+                    else: # short
+                        raw_ret = (entry_price - close_price) / entry_price
 
-                elif p_type == 'short':
-                    if hi >= sl_price:
-                        is_closed = True
-                        close_price = sl_price
-                        reason = 'sl'
-                    elif lo <= tp_price:
-                        is_closed = True
-                        close_price = tp_price
-                        reason = 'tp'
-
-                    if is_closed:
-                        if (hi >= sl_price) and (lo <= tp_price):
+                else:
+                    # --- 1. TP/SL判定 ---
+                    if p_type == 'long':
+                        if lo <= sl_price:
+                            is_closed = True
                             close_price = sl_price
                             reason = 'sl'
-                        raw_ret = (entry_price - close_price) / entry_price
+                        elif hi >= tp_price:
+                            is_closed = True
+                            close_price = tp_price
+                            reason = 'tp'
+
+                        if is_closed:
+                            if (lo <= sl_price) and (hi >= tp_price):
+                                close_price = sl_price
+                                reason = 'sl'
+                            raw_ret = (close_price - entry_price) / entry_price
+
+                    elif p_type == 'short':
+                        if hi >= sl_price:
+                            is_closed = True
+                            close_price = sl_price
+                            reason = 'sl'
+                        elif lo <= tp_price:
+                            is_closed = True
+                            close_price = tp_price
+                            reason = 'tp'
+
+                        if is_closed:
+                            if (hi >= sl_price) and (lo <= tp_price):
+                                close_price = sl_price
+                                reason = 'sl'
+                            raw_ret = (entry_price - close_price) / entry_price
 
                 if is_closed:
                     final_ret = raw_ret - self.fee
@@ -744,20 +766,22 @@ def evaluate_performance(symbol, all_5m_data, optimize=False, use_model_symbol=N
             sl_range = [0.005, 0.01, 0.02, 0.03]
             th_long_range = [0.5, 0.55, 0.6, 0.65, 0.7]
             th_short_range = [0.5, 0.45, 0.4, 0.35, 0.3]
+            time_limit_range = [0, 15, 30, 60, 120, 240, 480, 1440]
 
             best_metric = -999.0
             best_params = {}
             best_result = {}
 
-            combinations = list(itertools.product(tp_range, sl_range, th_long_range, th_short_range))
+            combinations = list(itertools.product(tp_range, sl_range, th_long_range, th_short_range, time_limit_range))
             print(f"  [Info] {len(combinations)} 通りの組み合わせを検証します...")
 
-            for tp, sl, th_l, th_s in combinations:
+            for tp, sl, th_l, th_s, t_lim in combinations:
                 test_cfg = config.copy()
                 test_cfg['take_profit'] = tp
                 test_cfg['stop_loss'] = sl
                 test_cfg['threshold_long'] = th_l
                 test_cfg['threshold_short'] = th_s
+                test_cfg['time_limit'] = t_lim
 
                 sim = BacktestSimulator(test_cfg)
                 sim.run(all_5m_data, signals)
@@ -766,7 +790,7 @@ def evaluate_performance(symbol, all_5m_data, optimize=False, use_model_symbol=N
 
                 if metrics['total_trades'] >= 10 and score > best_metric:
                     best_metric = score
-                    best_params = {'TP': tp, 'SL': sl, 'TH_L': th_l, 'TH_S': th_s}
+                    best_params = {'TP': tp, 'SL': sl, 'TH_L': th_l, 'TH_S': th_s, 'TimeLimit': t_lim}
                     best_result = metrics
 
             print(f"  [Best Result]")
@@ -778,7 +802,10 @@ def evaluate_performance(symbol, all_5m_data, optimize=False, use_model_symbol=N
             print(f"    DD     : {best_result.get('max_drawdown', 0):.2%}")
 
         else:
-            sim = BacktestSimulator(config)
+            run_cfg = config.copy()
+            run_cfg['time_limit'] = config.get(f'time_limit_{key}', 0)
+
+            sim = BacktestSimulator(run_cfg)
             sim.run(all_5m_data, signals)
             metrics = sim.get_metrics()
 
